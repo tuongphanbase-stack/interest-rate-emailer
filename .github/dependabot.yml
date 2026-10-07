@@ -1,0 +1,18 @@
+# Dependabot checks for outdated and vulnerable dependencies and opens
+# a pull request to update them. Updates are grouped to keep PRs few.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      python:
+        patterns: ["*"]
