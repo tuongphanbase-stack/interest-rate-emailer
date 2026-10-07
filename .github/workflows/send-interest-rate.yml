@@ -11,6 +11,10 @@ permissions:
 jobs:
   send-interest-rate:
     runs-on: ubuntu-latest
+    env:
+      # Without the Gmail secrets, the Send step is skipped (with a warning)
+      # instead of failing the run every time.
+      HAS_GMAIL: ${{ secrets.GMAIL_ADDRESS != '' && secrets.GMAIL_APP_PASSWORD != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,7 +62,12 @@ jobs:
           SEND_ONLY_ON_CHANGE: "false"
         run: python interest_rate_emailer.py generate
 
+      - name: Warn that the Gmail secrets are missing
+        if: env.HAS_GMAIL != 'true'
+        run: echo "::warning::GMAIL_ADDRESS / GMAIL_APP_PASSWORD secrets are not set, so no email was sent. Add them in Settings -> Secrets and variables -> Actions."
+
       - name: Send email
+        if: env.HAS_GMAIL == 'true'
         env:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
