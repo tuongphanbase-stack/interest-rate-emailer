@@ -11,6 +11,7 @@ permissions:
 jobs:
   send-interest-rate:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       # Without the Gmail secrets, the Send step is skipped (with a warning)
       # instead of failing the run every time.
