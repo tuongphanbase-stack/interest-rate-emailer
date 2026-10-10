@@ -87,8 +87,11 @@ rate shown in a bank's own app). The email shows both, side by side, for
 every term the bank publishes (typically 1/3/6/9/12 months, sometimes
 more) — not just a single headline number. Each term row also gets its
 own "changed" badge if that specific term/channel moved since the last
-run. If a bank's page layout changes and no rows can be parsed, the error
-includes a snippet of what the page actually contained, so a failure is
+run. To keep the email under Gmail's ~102 KB clipping limit, when the
+banks together list more than 80 rows the longest lists are shown with
+their key terms only (1/3/6/9/12/13/18/24/36 months, plus any row that
+changed), with a note saying how many rows were left out. If a bank's
+page layout changes and no rows can be parsed, the error includes a snippet of what the page actually contained, so a failure is
 diagnosable from the email itself rather than requiring another round of
 guessing — check `fetch_bank_all_rates()` in `interest_rate_emailer.py`
 against whatever that snippet shows.

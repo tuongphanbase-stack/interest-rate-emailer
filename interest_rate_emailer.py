@@ -51,7 +51,10 @@ import html
 import time
 import smtplib
 import traceback
+import unicodedata
+from collections import Counter
 from datetime import datetime
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -322,6 +325,25 @@ def diagnostic_snippet(soup, around_pattern=r"12"):
     return text[start:start + 300]
 
 
+PLAIN_RATE_PATTERN = re.compile(r"\s*(\d+(?:[.,]\d+)?)\s*%?\s*")
+
+
+def normalize_rate(rate):
+    """Puts a scraped rate string into one format: "2,1%", "2.1", "2.100%"
+    and "2.10%" all become "2.10%" (at least two decimals, never rounded). Banks
+    write rates differently (BIDV and MB Bank use a decimal comma), so
+    comparing the raw strings flagged unchanged rates as changed. Anything
+    that isn't a plain number ("-", None, free text) is returned unchanged.
+    """
+    match = PLAIN_RATE_PATTERN.fullmatch(rate) if isinstance(rate, str) else None
+    if not match:
+        return rate
+    value = Decimal(match.group(1).replace(",", ".")).normalize()  # drops trailing zeros
+    if value.as_tuple().exponent > -2:
+        value = value.quantize(Decimal("0.01"))
+    return f"{value}%"
+
+
 def render_js_page(url, wait_selector=None, goto_timeout_ms=35000, selector_timeout_ms=40000,
                     settle_ms=3000, attempts=3):
     """Loads a page with a headless Chromium browser and returns the fully
@@ -567,6 +589,37 @@ def fetch_bank_all_rates(bank_slug):
     return {"as_of": as_of, "terms": terms}
 
 
+def _first_table_terms(soup, rate_from_cells):
+    """Reads term rows from the FIRST <table> on a rendered page that has
+    any, as [{term, counter, online}] with the same rate for both channels.
+    rate_from_cells(cells) picks the rate cell out of a row's cell texts,
+    or returns None to skip the row.
+
+    Only the first table: BIDV's and MB Bank's pages stack several tables
+    (the standard savings table first, then other savings products, loan
+    and credit-card rates), and they reuse the same term labels - BIDV's
+    "3 Tháng" appeared 3 times and MB Bank's "01 tháng" 8 times, 245 rows
+    in all. Merged into one list, the email showed every one of them and
+    compared each against the wrong previous row.
+    """
+    for table in soup.find_all("table"):
+        terms = []
+        for row in table.find_all("tr"):
+            cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+            if len(cells) < 2 or not re.search(r"\d", cells[0]):
+                continue  # header row
+            if "{{" in " ".join(cells):
+                continue  # unrendered template row - the page's data didn't load
+            rate = rate_from_cells(cells)
+            if rate is None:
+                continue
+            rate = normalize_rate(rate)
+            terms.append({"term": term_key(cells[0]), "counter": rate, "online": rate})
+        if terms:
+            return terms
+    return []
+
+
 def fetch_bidv_official_rates():
     """BIDV's own official rate table, for every term listed.
 
@@ -624,25 +677,14 @@ def fetch_bidv_official_rates():
                 raise last_error
 
     soup = BeautifulSoup(rendered_html, "html.parser")
-    tables = soup.find_all("table")
-    if not tables:
+    if not soup.find("table"):
         raise RuntimeError(f"No rate table found after form submit. Page text sample: {diagnostic_snippet(soup)!r}")
 
-    terms = []
-    for table in tables:
-        for row in table.find_all("tr"):
-            cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-            if len(cells) < 4 or not re.search(r"\d", cells[0]):
-                continue
-            if "{{" in " ".join(cells):
-                continue  # unrendered template row - form submit didn't take effect
-            term_label = cells[0]
-            vnd_rate = cells[3] if len(cells) > 3 else cells[-1]
-            if not re.search(r"\d", vnd_rate):
-                continue
-            if not vnd_rate.endswith("%"):
-                vnd_rate += "%"
-            terms.append({"term": term_label, "counter": vnd_rate, "online": vnd_rate})
+    # The VND rate is the 4th column (after term and two foreign-currency
+    # columns in BIDV's layout).
+    terms = _first_table_terms(
+        soup, lambda cells: cells[3] if len(cells) >= 4 and PLAIN_RATE_PATTERN.fullmatch(cells[3]) else None
+    )
 
     if not terms:
         raise RuntimeError(
@@ -933,7 +975,8 @@ def _fetch_generic_official_table(url):
     loaded. Waiting on percentage text instead is agnostic to which the
     page actually uses.
 
-    Parses a real <table> first, in case one does exist, and falls back
+    Parses the first real <table> that has rate rows, in case one does
+    exist (see _first_table_terms for why only the first), and falls back
     to a general "term label followed by a percentage" text pattern
     otherwise. No promises this works for any of the three - if it
     reports "unavailable", check the diagnostic snippet in the error
@@ -944,21 +987,9 @@ def _fetch_generic_official_table(url):
     rendered_html = render_js_page(url, wait_selector="text=/\\d\\s*%/")
     soup = BeautifulSoup(rendered_html, "html.parser")
 
-    terms = []
-    for table in soup.find_all("table"):
-        for row in table.find_all("tr"):
-            cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-            if len(cells) < 2 or not re.search(r"\d", cells[0]):
-                continue
-            if "{{" in " ".join(cells):
-                continue
-            term_label = cells[0]
-            rate = next((c for c in cells[1:] if re.search(r"\d", c)), None)
-            if not rate:
-                continue
-            if not rate.endswith("%"):
-                rate += "%"
-            terms.append({"term": term_label, "counter": rate, "online": rate})
+    terms = _first_table_terms(
+        soup, lambda cells: next((c for c in cells[1:] if PLAIN_RATE_PATTERN.fullmatch(c)), None)
+    )
 
     if not terms:
         text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
@@ -972,7 +1003,7 @@ def _fetch_generic_official_table(url):
             if term_label in seen:
                 continue
             seen.add(term_label)
-            rate = m.group(2).replace(",", ".") + "%"
+            rate = normalize_rate(m.group(2))
             terms.append({"term": term_label, "counter": rate, "online": rate})
 
     if not terms:
@@ -1314,13 +1345,114 @@ def prev_special_rate(previous_rates, name):
     return section.get(name) if isinstance(section, dict) else None
 
 
-def find_prev_term(prev_terms, term_label):
-    if not prev_terms:
+def term_key(label):
+    """A term label with Unicode form and whitespace evened out, so the same
+    label read twice ("04 tháng" with a regular vs a non-breaking space,
+    composed vs decomposed accents) compares equal.
+    """
+    return " ".join(unicodedata.normalize("NFC", label or "").split())
+
+
+def rate_changed(prev_rate, rate):
+    """True when there is a previous rate and it differs from rate once both
+    are normalized - so "2,1%" vs "2.10%" is not a change.
+    """
+    return bool(prev_rate) and normalize_rate(prev_rate) != normalize_rate(rate)
+
+
+def pair_with_previous(terms, prev_terms):
+    """Pairs each of a bank's term rows with the previous run's row for the
+    same term (None when there isn't one), as [(term, prev_term)].
+
+    A label can appear more than once in a bank's list (a page whose
+    tables were merged, or a list saved by an older version of this
+    script), so the n-th row with a label is paired with the n-th previous
+    row with that label - always pairing with the first one compared
+    rows from different tables and showed a "was" badge on nearly every
+    row even when nothing had changed.
+    """
+    prev_by_label = {}
+    for pt in prev_terms or []:
+        prev_by_label.setdefault(term_key(pt.get("term")), []).append(pt)
+    seen = Counter()
+    pairs = []
+    for t in terms:
+        key = term_key(t["term"])
+        candidates = prev_by_label.get(key, [])
+        pairs.append((t, candidates[seen[key]] if seen[key] < len(candidates) else None))
+        seen[key] += 1
+    return pairs
+
+
+def term_row_changed(t, prev_t):
+    return bool(prev_t) and (
+        rate_changed(prev_t.get("counter"), t["counter"]) or rate_changed(prev_t.get("online"), t["online"])
+    )
+
+
+# Term rows are the bulk of the email (~350 bytes of HTML each), and Gmail
+# clips an email whose HTML passes ~102 KB, hiding everything after that
+# point. When the banks together list more than MAX_TERM_ROWS rows, the
+# longest lists are cut down to their key terms until the total fits.
+MAX_TERM_ROWS = 80
+KEY_TERM_MONTHS = (1, 3, 6, 9, 12, 13, 18, 24, 36)
+TERM_MONTHS_PATTERN = re.compile(r"0*(\d+)\s*(?:m|months?|tháng)", re.I)
+
+
+def term_months(label):
+    """Length of a plain month term ("12 months", "12M", "12 Tháng",
+    "012 tháng") in months, or None for anything else (weeks, ranges...).
+    """
+    match = TERM_MONTHS_PATTERN.fullmatch(term_key(label))
+    return int(match.group(1)) if match else None
+
+
+def banks_to_shorten(commercial_banks):
+    """Names of the banks whose term lists are shown with key terms only,
+    longest list first, until the rows left add up to MAX_TERM_ROWS or less.
+    """
+    counts = {name: len(r["terms"]) for name, r in commercial_banks.items() if r.get("ok")}
+    total = sum(counts.values())
+    shortened = set()
+    for name in sorted(counts, key=lambda n: counts[n], reverse=True):
+        if total <= MAX_TERM_ROWS:
+            break
+        shortened.add(name)
+        total -= max(0, counts[name] - len(KEY_TERM_MONTHS))
+    return shortened
+
+
+def terms_to_show(terms, prev_terms, shorten=False):
+    """The (term, prev_term) pairs to show for one bank, and how many rows
+    were left out. With shorten, only the first row for each of
+    KEY_TERM_MONTHS is kept (or the first len(KEY_TERM_MONTHS) rows, if
+    none of the labels is a plain month term), plus every row whose rate
+    changed - a change is never hidden.
+    """
+    pairs = pair_with_previous(terms, prev_terms)
+    if not shorten:
+        return pairs, 0
+    has_key_terms = any(term_months(t["term"]) in KEY_TERM_MONTHS for t, _ in pairs)
+    shown, seen_months = [], set()
+    for i, (t, prev_t) in enumerate(pairs):
+        months = term_months(t["term"])
+        if has_key_terms:
+            keep = months in KEY_TERM_MONTHS and months not in seen_months
+            seen_months.add(months)
+        else:
+            keep = i < len(KEY_TERM_MONTHS)
+        if keep or term_row_changed(t, prev_t):
+            shown.append((t, prev_t))
+    return shown, len(pairs) - len(shown)
+
+
+def _terms_signature(terms):
+    if terms is None:
         return None
-    for pt in prev_terms:
-        if pt.get("term") == term_label:
-            return pt
-    return None
+    return [
+        (term_key(t.get("term")), normalize_rate(t.get("counter")), normalize_rate(t.get("online")))
+        for t in terms
+    ]
 
 
 def has_changed(results, previous_rates):
@@ -1328,15 +1460,15 @@ def has_changed(results, previous_rates):
         return True
     for name, r in results.get("central_banks", {}).items():
         prev = prev_entry(previous_rates, name)
-        if r["policy"].get("ok") and prev.get("policy") != r["policy"]["rate"]:
+        if r["policy"].get("ok") and normalize_rate(prev.get("policy")) != normalize_rate(r["policy"]["rate"]):
             return True
-        if r["deposit"].get("ok") and prev.get("deposit") != r["deposit"]["rate"]:
+        if r["deposit"].get("ok") and normalize_rate(prev.get("deposit")) != normalize_rate(r["deposit"]["rate"]):
             return True
     for name, r in results.get("commercial_banks", {}).items():
-        if r.get("ok") and prev_commercial_terms(previous_rates, name) != r["terms"]:
+        if r.get("ok") and _terms_signature(prev_commercial_terms(previous_rates, name)) != _terms_signature(r["terms"]):
             return True
     for name, r in results.get("special_products", {}).items():
-        if r.get("ok") and prev_special_rate(previous_rates, name) != r["rate"]:
+        if r.get("ok") and normalize_rate(prev_special_rate(previous_rates, name)) != normalize_rate(r["rate"]):
             return True
     return False
 
@@ -1416,7 +1548,7 @@ def format_email_body(results, previous_rates):
             s = f"{d['rate']} ({d['as_of']})"
             if is_stale_annual(d["as_of"]):
                 s += " [annual figure, may be outdated]"
-            if prev_val and prev_val != d["rate"]:
+            if rate_changed(prev_val, d["rate"]):
                 s += f" [was {prev_val}]"
             return s
         return f"unavailable ({d.get('error', 'unknown error')})"
@@ -1437,25 +1569,27 @@ def format_email_body(results, previous_rates):
     lines.append("")
     lines.append("Vietnam commercial banks - all terms, at-counter vs online (%/year)")
     lines.append("=" * 95)
+    shortened = banks_to_shorten(commercial_banks)
     for name, _url in COMMERCIAL_BANK_SOURCES:
         r = commercial_banks.get(name, {})
         lines.append("")
         if not r.get("ok"):
             lines.append(f"{name} - unavailable ({r.get('error', 'unknown error')})")
             continue
-        prev_terms = prev_commercial_terms(previous_rates, name)
+        shown, hidden = terms_to_show(r["terms"], prev_commercial_terms(previous_rates, name), name in shortened)
         lines.append(f"{name} (as of {r['as_of']})")
         lines.append(f"  {'Term':<14} | {'At counter':<20} | {'Online'}")
-        for t in r["terms"]:
-            prev_t = find_prev_term(prev_terms, t["term"])
+        for t, prev_t in shown:
             counter_s = t["counter"]
             online_s = t["online"]
             if prev_t:
-                if prev_t.get("counter") not in (None, t["counter"]):
+                if rate_changed(prev_t.get("counter"), t["counter"]):
                     counter_s += f" [was {prev_t['counter']}]"
-                if prev_t.get("online") not in (None, t["online"]):
+                if rate_changed(prev_t.get("online"), t["online"]):
                     online_s += f" [was {prev_t['online']}]"
             lines.append(f"  {t['term']:<14} | {counter_s:<20} | {online_s}")
+        if hidden:
+            lines.append(f"  (key terms only - {hidden} more rows on the bank's site)")
 
     lines.append("")
     lines.append("Special products (not regular savings - see note)")
@@ -1581,7 +1715,7 @@ def format_email_html(results, previous_rates):
     def rate_cell(d, prev_val, border, accent):
         if d.get("ok"):
             change_badge = ""
-            if prev_val and prev_val != d["rate"]:
+            if rate_changed(prev_val, d["rate"]):
                 change_badge = "<br>" + badge(f"changed &middot; was {esc(prev_val)}", CHANGED_BG, CHANGED_FG)
             stale_badge = ""
             if is_stale_annual(d["as_of"]):
@@ -1617,6 +1751,13 @@ def format_email_html(results, previous_rates):
             </tr>"""
         rows_html.append(row)
 
+    shortened = banks_to_shorten(commercial_banks)
+    commercial_table_style = f"font-family:{FONT_STACK};"
+    col_label_style = (
+        f"padding:6px 20px;background:{EMERALD_TINT};font-size:11px;text-transform:uppercase;"
+        f"letter-spacing:0.03em;font-weight:700;color:{EMERALD};border-bottom:1px solid {BORDER};"
+    )
+
     def bank_block_html(name, r, is_last_bank):
         if not r.get("ok"):
             err = esc(r.get("error", "unknown error"))
@@ -1630,7 +1771,7 @@ def format_email_html(results, previous_rates):
               </td>
             </tr>"""
 
-        prev_terms = prev_commercial_terms(previous_rates, name)
+        shown, hidden = terms_to_show(r["terms"], prev_commercial_terms(previous_rates, name), name in shortened)
         rows = [f"""
             <tr>
               <td colspan="3" style="padding:16px 20px 4px;background:{EMERALD_TINT};font-family:{FONT_STACK};">
@@ -1639,30 +1780,34 @@ def format_email_html(results, previous_rates):
               </td>
             </tr>
             <tr>
-              <td style="padding:6px 20px;background:{EMERALD_TINT};font-family:{FONT_STACK};font-size:11px;text-transform:uppercase;
-                         letter-spacing:0.03em;font-weight:700;color:{EMERALD};border-bottom:1px solid {BORDER};">Term</td>
-              <td style="padding:6px 20px;background:{EMERALD_TINT};font-family:{FONT_STACK};font-size:11px;text-transform:uppercase;
-                         letter-spacing:0.03em;font-weight:700;color:{EMERALD};border-bottom:1px solid {BORDER};">At counter</td>
-              <td style="padding:6px 20px;background:{EMERALD_TINT};font-family:{FONT_STACK};font-size:11px;text-transform:uppercase;
-                         letter-spacing:0.03em;font-weight:700;color:{EMERALD};border-bottom:1px solid {BORDER};">Online</td>
+              <td style="{col_label_style}">Term</td>
+              <td style="{col_label_style}">At counter</td>
+              <td style="{col_label_style}">Online</td>
             </tr>"""]
 
-        for i, t in enumerate(r["terms"]):
-            prev_t = find_prev_term(prev_terms, t["term"])
-            last_row = is_last_bank and i == len(r["terms"]) - 1
+        # Term rows are the bulk of the email, so they're kept compact: no
+        # indentation, and the font comes from the enclosing table (see
+        # commercial_table_style) rather than being repeated on every cell.
+        for i, (t, prev_t) in enumerate(shown):
+            last_row = is_last_bank and not hidden and i == len(shown) - 1
             border = "" if last_row else f"border-bottom:1px solid {BORDER};"
             counter_badge = ""
             online_badge = ""
-            if prev_t and prev_t.get("counter") not in (None, t["counter"]):
+            if prev_t and rate_changed(prev_t.get("counter"), t["counter"]):
                 counter_badge = "<br>" + badge(f"was {esc(prev_t['counter'])}", CHANGED_BG, CHANGED_FG)
-            if prev_t and prev_t.get("online") not in (None, t["online"]):
+            if prev_t and rate_changed(prev_t.get("online"), t["online"]):
                 online_badge = "<br>" + badge(f"was {esc(prev_t['online'])}", CHANGED_BG, CHANGED_FG)
-            rows.append(f"""
-            <tr>
-              <td style="padding:8px 20px;{border}font-family:{FONT_STACK};font-size:13px;color:{SLATE};">{esc(t['term'])}</td>
-              <td style="padding:8px 20px;{border}font-family:{FONT_STACK};font-size:15px;font-weight:700;color:{INK};">{esc(t['counter'])}{counter_badge}</td>
-              <td style="padding:8px 20px;{border}font-family:{FONT_STACK};font-size:15px;font-weight:700;color:{EMERALD};">{esc(t['online'])}{online_badge}</td>
-            </tr>""")
+            rows.append(
+                f'\n<tr><td style="padding:8px 20px;{border}font-size:13px;color:{SLATE};">{esc(t["term"])}</td>'
+                f'<td style="padding:8px 20px;{border}font-size:15px;font-weight:700;color:{INK};">{esc(t["counter"])}{counter_badge}</td>'
+                f'<td style="padding:8px 20px;{border}font-size:15px;font-weight:700;color:{EMERALD};">{esc(t["online"])}{online_badge}</td></tr>'
+            )
+        if hidden:
+            border = "" if is_last_bank else f"border-bottom:1px solid {BORDER};"
+            rows.append(
+                f'\n<tr><td colspan="3" style="padding:8px 20px;{border}font-size:12px;color:{SLATE};font-style:italic;">'
+                f"Key terms only &middot; {hidden} more rows on the bank's site</td></tr>"
+            )
         return "".join(rows)
 
     commercial_rows_html = [
@@ -1744,7 +1889,7 @@ def format_email_html(results, previous_rates):
         {section_header("&#127974;", "Vietnam Commercial Banks", "All terms &middot; at counter vs online (%/year)", EMERALD, EMERALD_TINT)}
         <tr>
           <td>
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="{commercial_table_style}">
               {"".join(commercial_rows_html)}
             </table>
           </td>
